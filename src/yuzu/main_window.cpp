@@ -111,18 +111,6 @@
 
 #include "qt_common/render/emu_thread.h"
 
-// These are wrappers to avoid the calls to CreateDirectory and CreateFile because of the Windows
-// defines.
-static FileSys::VirtualDir VfsFilesystemCreateDirectoryWrapper(const std::string& path,
-                                                               FileSys::OpenMode mode) {
-    return QtCommon::vfs->CreateDirectory(path, mode);
-}
-
-static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::VirtualDir& dir,
-                                                          const std::string& path) {
-    return dir->CreateFile(path);
-}
-
 // Frontend //
 #include "frontend_common/play_time_manager.h"
 
@@ -154,9 +142,17 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
+#include "core/file_sys/content_archive.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/nup_writer.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
+#include "core/file_sys/romfs_export.h"
 #include "core/file_sys/savedata_factory.h"
+
+#include <chrono>
+#include <limits>
 
 #include "core/tools/renderdoc.h"
 
@@ -2483,68 +2479,6 @@ void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
     QDesktopServices::openUrl(QUrl::fromLocalFile(qpath));
 }
 
-static bool RomFSRawCopy(size_t total_size, size_t& read_size, QProgressDialog& dialog,
-                         const FileSys::VirtualDir& src, const FileSys::VirtualDir& dest,
-                         bool full) {
-    if (src == nullptr || dest == nullptr || !src->IsReadable() || !dest->IsWritable())
-        return false;
-    if (dialog.wasCanceled())
-        return false;
-
-    std::vector<u8> buffer(CopyBufferSize);
-    auto last_timestamp = std::chrono::steady_clock::now();
-
-    const auto QtRawCopy = [&](const FileSys::VirtualFile& src_file,
-                               const FileSys::VirtualFile& dest_file) {
-        if (src_file == nullptr || dest_file == nullptr) {
-            return false;
-        }
-        if (!dest_file->Resize(src_file->GetSize())) {
-            return false;
-        }
-
-        for (std::size_t i = 0; i < src_file->GetSize(); i += buffer.size()) {
-            if (dialog.wasCanceled()) {
-                dest_file->Resize(0);
-                return false;
-            }
-
-            using namespace std::literals::chrono_literals;
-            const auto new_timestamp = std::chrono::steady_clock::now();
-
-            if ((new_timestamp - last_timestamp) > 33ms) {
-                last_timestamp = new_timestamp;
-                dialog.setValue(
-                    static_cast<int>((std::min)(read_size, total_size) * 100 / total_size));
-                QCoreApplication::processEvents();
-            }
-
-            const auto read = src_file->Read(buffer.data(), buffer.size(), i);
-            dest_file->Write(buffer.data(), read, i);
-
-            read_size += read;
-        }
-
-        return true;
-    };
-
-    if (full) {
-        for (const auto& file : src->GetFiles()) {
-            const auto out = VfsDirectoryCreateFileWrapper(dest, file->GetName());
-            if (!QtRawCopy(file, out))
-                return false;
-        }
-    }
-
-    for (const auto& dir : src->GetSubdirectories()) {
-        const auto out = dest->CreateSubdirectory(dir->GetName());
-        if (!RomFSRawCopy(total_size, read_size, dialog, dir, out, full))
-            return false;
-    }
-
-    return true;
-}
-
 // TODO(crueter): All this can be transfered to qt_common
 // Aldoe I need to decide re: message boxes for QML
 // translations_common? strings_common? qt_strings? who knows
@@ -2654,67 +2588,220 @@ void MainWindow::OnGameListRemovePlayTimeData(u64 program_id) {
     game_list->PopulateAsync(UISettings::values.game_dirs);
 }
 
+namespace {
+
+enum class InstalledDumpChoice { Selected, Cancelled, None };
+
+InstalledDumpChoice SelectInstalledDumpTarget(
+    QWidget* parent, const std::vector<FileSys::InstalledRomFSDumpTarget>& targets, u64* title_id,
+    FileSys::ContentRecordType* type, const QString& title, const QString& prompt) {
+    if (targets.empty() || title_id == nullptr || type == nullptr) {
+        return InstalledDumpChoice::None;
+    }
+
+    std::size_t index = 0;
+    if (targets.size() > 1) {
+        QStringList list;
+        list.reserve(static_cast<int>(targets.size()));
+        for (const auto& target : targets) {
+            const auto hex_title_id = QString::fromStdString(fmt::format("{:X}", target.title_id));
+            if (target.record_type == FileSys::ContentRecordType::Program) {
+                list.push_back(QStringLiteral("Program [%1]").arg(hex_title_id));
+            } else if (target.record_type == FileSys::ContentRecordType::HtmlDocument) {
+                list.push_back(QStringLiteral("HTML document [%1]").arg(hex_title_id));
+            } else if (target.record_type == FileSys::ContentRecordType::LegalInformation) {
+                list.push_back(QStringLiteral("Legal information [%1]").arg(hex_title_id));
+            } else {
+                list.push_back(QStringLiteral("DLC %1 [%2]")
+                                   .arg(target.title_id & 0x7FF)
+                                   .arg(hex_title_id));
+            }
+        }
+
+        bool ok = false;
+        const auto res = QInputDialog::getItem(parent, title, prompt, list, 0, false, &ok);
+        if (!ok) {
+            return InstalledDumpChoice::Cancelled;
+        }
+        const auto found = list.indexOf(res);
+        if (found < 0 || static_cast<std::size_t>(found) >= targets.size()) {
+            return InstalledDumpChoice::None;
+        }
+        index = static_cast<std::size_t>(found);
+    }
+
+    *title_id = targets[index].title_id;
+    *type = targets[index].record_type;
+    return InstalledDumpChoice::Selected;
+}
+
+std::filesystem::path ExistingPathForSpace(const std::filesystem::path& path) {
+    std::error_code error;
+    auto probe = path;
+    while (!probe.empty() && !std::filesystem::exists(probe, error)) {
+        const auto parent = probe.parent_path();
+        if (parent == probe) {
+            break;
+        }
+        probe = parent;
+    }
+    return probe;
+}
+
+} // namespace
+
 void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_path,
                                      DumpRomFSTarget target) {
-    const auto failed = [this] {
-        QMessageBox::warning(this, tr("RomFS Extraction Failed!"),
-                             tr("There was an error copying the RomFS files or the user "
-                                "cancelled the operation."));
+    const auto fail = [this, program_id, &game_path](const std::string& detail) {
+        LOG_ERROR(Frontend, "RomFS extraction failed for {:016X} ({}): {}", program_id, game_path,
+                  detail);
+        QMessageBox::warning(this, tr("RomFS Extraction Failed!"), QString::fromStdString(detail));
+    };
+    const auto cancelled = [this, program_id](const std::string& detail) {
+        LOG_INFO(Frontend, "RomFS extraction cancelled for {:016X}: {}", program_id, detail);
+        QMessageBox::information(this, tr("RomFS Extraction Cancelled"),
+                                 QString::fromStdString(detail));
     };
 
-    const auto loader = Loader::GetLoader(
-        *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read));
-    if (loader == nullptr) {
-        failed();
+    LOG_INFO(Frontend, "RomFS extraction requested for {:016X} from {}", program_id, game_path);
+
+    const auto vfs_file = QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read);
+    if (vfs_file == nullptr) {
+        fail(fmt::format("Could not open \"{}\" for reading.", game_path));
         return;
     }
 
-    FileSys::VirtualFile packed_update_raw{};
-    loader->ReadUpdateRaw(packed_update_raw);
-
+    const auto loader = Loader::GetLoader(*QtCommon::system, vfs_file);
     const auto& installed = QtCommon::system->GetContentProvider();
+    const auto installed_targets = FileSys::ListInstalledRomFSDumpTargets(
+        installed, program_id, [&](const FileSys::ContentProviderEntry& entry) {
+            const auto nca = installed.GetEntry(entry);
+            if (!nca) {
+                LOG_ERROR(Frontend, "Installed title {:016X} content type {} returned no NCA",
+                          entry.title_id, static_cast<u8>(entry.type));
+                return false;
+            }
+            const auto status = nca->GetStatus();
+            if (status != Loader::ResultStatus::Success) {
+                LOG_ERROR(Frontend,
+                          "Installed title {:016X} content type {} is not readable: {}",
+                          entry.title_id, static_cast<u8>(entry.type),
+                          Loader::GetResultStatusString(status));
+                return false;
+            }
+            return true;
+        });
 
-    u64 title_id{};
-    u8 raw_type{};
-    if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
-        failed();
+    const auto route = FileSys::RouteRomFSDump(!installed_targets.empty(),
+                                               FileSys::NupContainer::IsNupFile(vfs_file));
+    LOG_INFO(Frontend, "RomFS dump route for {:016X} is {} ({} installed candidate(s))", program_id,
+             FileSys::RomFSDumpRouteName(route), installed_targets.size());
+
+    FileSys::VirtualDir extracted;
+    FileSys::LooseNupRomFS loose_nup;
+    u64 title_id = program_id;
+    u64 space_bytes = 0;
+
+    if (route == FileSys::RomFSDumpRoute::Installed) {
+        if (loader == nullptr) {
+            fail(fmt::format(
+                "Installed RomFS entries exist for title {:016X}, but no loader recognized \"{}\".",
+                program_id, game_path));
+            return;
+        }
+
+        FileSys::ContentRecordType type{FileSys::ContentRecordType::Program};
+        const auto choice = SelectInstalledDumpTarget(
+            this, installed_targets, &title_id, &type, tr("Select RomFS Dump Target"),
+            tr("Please select which RomFS you would like to dump."));
+        if (choice == InstalledDumpChoice::Cancelled) {
+            cancelled("RomFS extraction was cancelled before any file was written.");
+            return;
+        }
+        if (choice != InstalledDumpChoice::Selected) {
+            fail(fmt::format("Could not choose an installed RomFS entry for title {:016X}.",
+                             program_id));
+            return;
+        }
+
+        FileSys::VirtualFile packed_update_raw;
+        loader->ReadUpdateRaw(packed_update_raw);
+
+        const auto base_nca = installed.GetEntry(title_id, type);
+        if (!base_nca) {
+            fail(fmt::format("Installed title {:016X} content type {} has no NCA.", title_id,
+                             static_cast<u8>(type)));
+            return;
+        }
+
+        const FileSys::NCA update_nca{packed_update_raw, nullptr};
+        if (type != FileSys::ContentRecordType::Program ||
+            update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
+            update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
+            packed_update_raw = {};
+        }
+
+        const auto base_romfs = base_nca->GetRomFS();
+        if (base_romfs == nullptr) {
+            fail(fmt::format("Installed title {:016X} content type {} has no RomFS.", title_id,
+                             static_cast<u8>(type)));
+            return;
+        }
+
+        const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
+                                       installed};
+        const auto romfs =
+            pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
+        if (romfs == nullptr) {
+            fail(fmt::format("Installed RomFS for title {:016X} could not be prepared.", title_id));
+            return;
+        }
+
+        extracted = FileSys::ExtractRomFS(romfs);
+        if (extracted == nullptr) {
+            fail(fmt::format(
+                "Installed RomFS image for title {:016X} could not be unpacked. The image is "
+                "missing its header or the header size is not 0x50 bytes.",
+                title_id));
+            return;
+        }
+        space_bytes = romfs->GetSize();
+        LOG_INFO(Frontend, "Dumping installed RomFS for title {:016X} content type {}", title_id,
+                 static_cast<u8>(type));
+    } else if (route == FileSys::RomFSDumpRoute::LooseNup) {
+        loose_nup = FileSys::OpenLooseNupProgramRomFS(vfs_file);
+        if (!loose_nup.ok || loose_nup.root == nullptr) {
+            fail(loose_nup.detail.empty() ? "The loose NUP RomFS could not be opened."
+                                          : loose_nup.detail);
+            return;
+        }
+        extracted = loose_nup.root;
+        if (loose_nup.title_id != 0) {
+            title_id = loose_nup.title_id;
+        }
+        if (title_id != program_id) {
+            LOG_WARNING(Frontend,
+                        "Loose NUP title {:016X} does not match the game list id {:016X}. "
+                        "The export uses the title id stored in the container.",
+                        title_id, program_id);
+        }
+        space_bytes = FileSys::RomFSTreeSize(extracted);
+        LOG_INFO(Frontend, "{}", loose_nup.detail);
+    } else {
+        fail(fmt::format(
+            "No installed RomFS entry for title {:016X}, and \"{}\" is not a NUP container. "
+            "Dump RomFS reads installed content, or a loose NUP that already contains the "
+            "program RomFS. Nothing was written.",
+            program_id, game_path));
         return;
     }
 
-    const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
-    const auto base_nca = installed.GetEntry(title_id, type);
-    if (!base_nca) {
-        failed();
-        return;
-    }
-
-    const FileSys::NCA update_nca{packed_update_raw, nullptr};
-    if (type != FileSys::ContentRecordType::Program ||
-        update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
-        update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
-        packed_update_raw = {};
-    }
-
-    const auto base_romfs = base_nca->GetRomFS();
     const auto dump_dir =
         target == DumpRomFSTarget::Normal
             ? Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)
             : Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir) / "atmosphere" / "contents";
-    const auto romfs_dir = fmt::format("{:016X}/romfs", title_id);
-
-    const auto path = Common::FS::PathToUTF8String(dump_dir / romfs_dir);
-
-    const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
-                                   installed};
-    auto romfs = pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
-
-    const auto out = VfsFilesystemCreateDirectoryWrapper(path, FileSys::OpenMode::ReadWrite);
-
-    if (out == nullptr) {
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
-        return;
-    }
+    const auto romfs_path = dump_dir / fmt::format("{:016X}", title_id) / "romfs";
+    const auto path_text = Common::FS::PathToUTF8String(romfs_path);
 
     bool ok = false;
     const QStringList selections{tr("Full"), tr("Skeleton")};
@@ -2725,29 +2812,36 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
            "structure."),
         selections, 0, false, &ok);
     if (!ok) {
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
+        cancelled("RomFS extraction was cancelled before any file was written.");
         return;
     }
+    const bool full = res == selections.constFirst();
 
-    const auto extracted = FileSys::ExtractRomFS(romfs);
-    if (extracted == nullptr) {
-        failed();
-        return;
-    }
-
-    const auto full = res == selections.constFirst();
-
-    // The expected required space is the size of the RomFS + 1 GiB
-    const auto minimum_free_space = romfs->GetSize() + 0x40000000;
-
-    if (full && Common::FS::GetFreeSpaceSize(path) < minimum_free_space) {
-        QMessageBox::warning(this, tr("RomFS Extraction Failed!"),
-                             tr("There is not enough free space at %1 to extract the RomFS. Please "
-                                "free up space or select a different dump directory at "
-                                "Emulation > Configure > System > Filesystem > Dump Root")
-                                 .arg(QString::fromStdString(path)));
-        return;
+    if (full) {
+        constexpr u64 Margin = 0x40000000;
+        if (space_bytes > std::numeric_limits<u64>::max() - Margin) {
+            fail("The RomFS is too large to check free space.");
+            return;
+        }
+        const auto minimum_free_space = space_bytes + Margin;
+        const auto probe = ExistingPathForSpace(romfs_path);
+        const auto free = Common::FS::GetFreeSpaceSize(probe);
+        if (probe.empty() || free < minimum_free_space) {
+            QMessageBox::warning(
+                this, tr("RomFS Extraction Failed!"),
+                tr("There is not enough free space at %1 to extract the RomFS. Please "
+                   "free up space or select a different dump directory at "
+                   "Emulation > Configure > System > Filesystem > Dump Root")
+                        .arg(QString::fromStdString(path_text)) +
+                    QStringLiteral("\n\n") +
+                    QString::fromStdString(fmt::format(
+                        "Required: {} bytes (RomFS plus 1 GiB). Available at {}: {} bytes.",
+                        minimum_free_space, Common::FS::PathToUTF8String(probe), free)));
+            LOG_ERROR(Frontend,
+                      "RomFS extraction needs {} bytes at {} and {} bytes are available at {}",
+                      minimum_free_space, path_text, free, Common::FS::PathToUTF8String(probe));
+            return;
+        }
     }
 
     QProgressDialog progress(tr("Extracting RomFS..."), tr("Cancel"), 0, 100, this);
@@ -2756,18 +2850,47 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
     progress.setAutoClose(false);
     progress.setAutoReset(false);
 
-    size_t read_size = 0;
+    FileSys::RomFSExportOptions export_options;
+    export_options.destination = romfs_path;
+    export_options.full = full;
+    export_options.protect_source = std::filesystem::path{
+        std::u8string{reinterpret_cast<const char8_t*>(game_path.data()), game_path.size()}};
+    const auto nand = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+    export_options.protected_directories.push_back(nand / "user" / "save");
+    export_options.protected_directories.push_back(nand / "system" / "save");
 
-    if (RomFSRawCopy(romfs->GetSize(), read_size, progress, extracted, out, full)) {
-        progress.close();
-        QMessageBox::information(this, tr("RomFS Extraction Succeeded!"),
-                                 tr("The operation completed successfully."));
-        QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(path)));
-    } else {
-        progress.close();
-        failed();
-        QtCommon::vfs->DeleteDirectory(path);
+    auto last_update = std::chrono::steady_clock::now();
+    const auto exported = FileSys::ExportRomFSTree(
+        extracted, export_options, [&](u64 done, u64 total) {
+            if (progress.wasCanceled()) {
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (done != total && now - last_update < std::chrono::milliseconds{33}) {
+                return true;
+            }
+            last_update = now;
+            const int value =
+                total == 0 ? 0 : static_cast<int>((std::min)(done, total) * 100 / total);
+            progress.setValue(value);
+            QCoreApplication::processEvents();
+            return !progress.wasCanceled();
+        });
+    progress.close();
+
+    if (exported.code == FileSys::RomFSExportCode::Cancelled) {
+        cancelled(exported.detail.empty() ? "RomFS extraction was cancelled." : exported.detail);
+        return;
     }
+    if (exported.code != FileSys::RomFSExportCode::Success) {
+        fail(exported.detail.empty() ? "RomFS extraction failed." : exported.detail);
+        return;
+    }
+
+    LOG_INFO(Frontend, "RomFS extraction succeeded for {:016X}: {}", title_id, exported.detail);
+    QMessageBox::information(this, tr("RomFS Extraction Succeeded!"),
+                             QString::fromStdString(exported.detail));
+    QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(path_text)));
 }
 
 // END
@@ -4947,66 +5070,6 @@ void MainWindow::SetFPSSuffix() {
         m_fpsSuffix = limited ? QString{} : tr("Unlocked");
         break;
     }
-}
-
-bool MainWindow::SelectRomFSDumpTarget(const FileSys::ContentProvider& installed, u64 program_id,
-                                       u64* selected_title_id, u8* selected_content_record_type) {
-    using ContentInfo = std::tuple<u64, FileSys::TitleType, FileSys::ContentRecordType>;
-    boost::container::flat_set<ContentInfo> available_title_ids;
-
-    const auto RetrieveEntries = [&](FileSys::TitleType title_type,
-                                     FileSys::ContentRecordType record_type) {
-        const auto entries = installed.ListEntriesFilter(title_type, record_type);
-        for (const auto& entry : entries) {
-            if (FileSys::GetBaseTitleID(entry.title_id) == program_id &&
-                installed.GetEntry(entry)->GetStatus() == Loader::ResultStatus::Success) {
-                available_title_ids.insert({entry.title_id, title_type, record_type});
-            }
-        }
-    };
-
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::Program);
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::HtmlDocument);
-    RetrieveEntries(FileSys::TitleType::Application, FileSys::ContentRecordType::LegalInformation);
-    RetrieveEntries(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
-
-    if (available_title_ids.empty()) {
-        return false;
-    }
-
-    size_t title_index = 0;
-
-    if (available_title_ids.size() > 1) {
-        QStringList list;
-        for (auto& [title_id, title_type, record_type] : available_title_ids) {
-            const auto hex_title_id = QString::fromStdString(fmt::format("{:X}", title_id));
-            if (record_type == FileSys::ContentRecordType::Program) {
-                list.push_back(QStringLiteral("Program [%1]").arg(hex_title_id));
-            } else if (record_type == FileSys::ContentRecordType::HtmlDocument) {
-                list.push_back(QStringLiteral("HTML document [%1]").arg(hex_title_id));
-            } else if (record_type == FileSys::ContentRecordType::LegalInformation) {
-                list.push_back(QStringLiteral("Legal information [%1]").arg(hex_title_id));
-            } else {
-                list.push_back(
-                    QStringLiteral("DLC %1 [%2]").arg(title_id & 0x7FF).arg(hex_title_id));
-            }
-        }
-
-        bool ok;
-        const auto res = QInputDialog::getItem(
-            this, tr("Select RomFS Dump Target"),
-            tr("Please select which RomFS you would like to dump."), list, 0, false, &ok);
-        if (!ok) {
-            return false;
-        }
-
-        title_index = list.indexOf(res);
-    }
-
-    const auto& [title_id, title_type, record_type] = *available_title_ids.nth(title_index);
-    *selected_title_id = title_id;
-    *selected_content_record_type = static_cast<u8>(record_type);
-    return true;
 }
 
 bool MainWindow::ConfirmClose() {
