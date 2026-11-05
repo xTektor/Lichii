@@ -142,6 +142,8 @@ add_library(core STATIC
     file_sys/nup_writer.h
     file_sys/romfs.cpp
     file_sys/romfs.h
+    file_sys/romfs_export.cpp
+    file_sys/romfs_export.h
     file_sys/romfs_factory.cpp
     file_sys/romfs_factory.h
     file_sys/savedata_factory.cpp
