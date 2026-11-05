@@ -200,6 +200,15 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
+    // The merged update is already in ReadRomFS. Publish that image with LayeredFS applied
+    // so OpenCurrentProcess, which skips update patching when the RomFS is not updatable,
+    // still sees enabled mods.
+    if (const auto overrides = ApplyRomFSOverrides(system);
+        overrides != ResultStatus::Success && overrides != ResultStatus::ErrorNoRomFS) {
+        LOG_WARNING(Loader, "NUP RomFS overrides were not applied: {}",
+                    GetResultStatusString(overrides));
+    }
+
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
@@ -217,7 +226,30 @@ ResultStatus AppLoader_NUP::VerifyIntegrity(
     return nup->VerifyIntegrity(std::move(progress_callback));
 }
 
+ResultStatus AppLoader_NUP::ApplyRomFSOverrides(Core::System& system) {
+    if (layered_romfs) {
+        return ResultStatus::Success;
+    }
+    FileSys::VirtualFile merged;
+    if (const auto status = ReadRomFS(merged); status != ResultStatus::Success) {
+        return status;
+    }
+    const FileSys::PatchManager patch_manager{base_title_id, system.GetFileSystemController(),
+                                              system.GetContentProvider()};
+    layered_romfs = patch_manager.PatchRomFS(nullptr, std::move(merged),
+                                              FileSys::ContentRecordType::Program);
+    if (layered_romfs == nullptr) {
+        return ResultStatus::ErrorNoRomFS;
+    }
+    LOG_INFO(Loader, "NUP RomFS for title {:016X} is ready for runtime open", base_title_id);
+    return ResultStatus::Success;
+}
+
 ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
+    if (layered_romfs) {
+        out_file = layered_romfs;
+        return ResultStatus::Success;
+    }
     const auto base_index = nup->FindBasePackage();
     const auto base_romfs = base_index ? nup->GetRomFSDir(*base_index) : FileSys::VirtualDir{};
     const auto update_index = nup->FindBestUpdatePackage();

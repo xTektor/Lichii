@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - cursor/nup-romfs-export-*
+      - cursor/nup-romfs-override-*
     paths:
       - "src/**"
       - "!src/tests/**"
