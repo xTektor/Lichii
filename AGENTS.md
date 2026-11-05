@@ -106,3 +106,39 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 
 - Experiment switches (env flags that pick between candidate fixes) never merge to nx2. A proven fix ships as unconditional behaviour, and a disproven one is dropped.
 - Diagnostic tools (frame dump, `EDEN_NX2_REJECT_HASH`, traces, the debug server) stay in nx2, off unless their variable is set.
+
+## Cursor Cloud specific instructions
+
+The Cloud Agent image is Ubuntu 24.04. `install` puts the toolchain on the machine. It does not compile Lichii. Compile and unit-test on the agent.
+
+- `cmake` on `PATH` is 3.31.8 in `/usr/local/bin`. Apt's CMake 3.28 is older than `cmake_minimum_required(VERSION 3.31)`.
+- Compile with `/usr/local/bin/clang` and `clang++` (Clang 20) and `/usr/local/bin/ld.lld`. Distro Clang 18 rejects `-mtls-dialect=gnu2`, which `src/CMakeLists.txt` adds on Linux x86_64. `g++-14` is installed so Clang links `libstdc++`.
+- Qt 6.8.3, the same version CI uses, is at `/opt/qt/6.8.3/gcc_64`. Pass that directory as `CMAKE_PREFIX_PATH`.
+- Leave fmt to CPM. Apt fmt 9 does not provide `basic_format_string::get()`, which `src/common/logging.h` calls. Installing `libfmt-dev` makes CMake pick fmt 9 and the build fails. CPM's fmt is 12.1.0.
+- Apt SDL3 and Boost are older than `cpmfile.json`. Configure with `-DYUZU_USE_BUNDLED_SDL3=ON` and let CPM fetch Boost.
+- There is no GPU. Lavapipe is the Vulkan device (`mesa-vulkan-drivers`). For `vulkaninfo` and the emulator, set `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json`. The desktop GUI is `build/bin/lichii`. The CLI is `build/bin/eden-cli` (`--version`, `--help`).
+- Games, keys, and firmware are not in the environment. A green window with the Vulkan status bar and `eden-cli --version` is the hello-world. `./build/bin/tests` is the automated check.
+- A link of `yuzu` is memory-heavy on this VM. `cmake --build build --parallel 3` completed; a higher job count can OOM while the memory balloon is still inflated.
+
+```sh
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/local/bin/clang \
+  -DCMAKE_CXX_COMPILER=/usr/local/bin/clang++ \
+  -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+  -DBUILD_TESTING=ON \
+  -DYUZU_TESTS=ON \
+  -DYUZU_CMD=ON \
+  -DYUZU_ROOM=OFF \
+  -DYUZU_ROOM_STANDALONE=OFF \
+  -DYUZU_USE_BUNDLED_QT=OFF \
+  -DCMAKE_PREFIX_PATH=/opt/qt/6.8.3/gcc_64 \
+  -DYUZU_USE_BUNDLED_SDL3=ON \
+  -DVulkanHeaders_FORCE_BUNDLED=ON \
+  -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+  -DUSE_DISCORD_PRESENCE=OFF \
+  -DUSE_CCACHE=ON
+cmake --build build --target yuzu yuzu-cmd tests update_checker_tests --parallel 3
+./build/bin/tests
+./build/bin/eden-cli --version
+```
