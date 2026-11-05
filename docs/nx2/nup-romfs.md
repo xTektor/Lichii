@@ -50,20 +50,18 @@ space or dot, and Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`CO
 
 ## RomFS overrides and NUP
 
-A running NUP does not apply RomFS overrides. `AppLoader_NUP::IsRomFSUpdatable()`
-returns false, and `RomFSFactory::OpenCurrentProcess` then returns the packed RomFS
-from `ReadRomFS` without calling `PatchManager::ApplyLayeredFS`. Placing a file in
-the folders below does not change what the NUP title opens.
+`Load` calls `ApplyRomFSOverrides` before the process RomFS is published.
+`RomFSFactory::OpenCurrentProcess` then returns that image. The NUP stays
+non-updatable: an installed NCA update is not applied on top of the container. The
+override sits on the merged base and newest-update tree. Add-on packages stay
+unmounted. Dump RomFS does not call `ApplyRomFSOverrides`, so a dump is the packed
+tree without mods.
 
-Upstream pull request 366 (`file_sys: apply LayeredFS to non-updatable RomFS (NUP)`,
-https://github.com/Djihads80/Eglantine/pull/366) is open and not merged. It is not
-part of this change. This tree does not claim that an icon override is visible in a
-game.
+Only these directory names are consulted, without case: `romfs`, `romfslite`, and
+`romfs_ext`. `manual_html` is used for an HTML document. A UI replacement belongs
+under `romfs`. Its path is the path under the dumped `romfs` directory.
 
-The folders the other loaders consult, which are the ones a later LayeredFS change
-would use, are:
-
-Load directory, one mod folder per override (the folder name is the mod name):
+Load directory. Each immediate child of the title folder is one named mod:
 
 ```text
 <eden>/load/<title id>/<mod name>/romfs/<virtual path>
@@ -71,8 +69,8 @@ Load directory, one mod folder per override (the folder name is the mod name):
 <eden>/load/<title id>/<mod name>/romfs_ext/<virtual path>
 ```
 
-SD card Atmosphere layout. There is no extra mod-name directory; `romfs` sits directly
-under the title id:
+SD card Atmosphere layout. There is no extra mod-name directory. The title folder
+itself is the layer, and its directory name is the title id:
 
 ```text
 <eden>/sdmc/atmosphere/contents/<title id>/romfs/<virtual path>
@@ -80,23 +78,42 @@ under the title id:
 <eden>/sdmc/atmosphere/contents/<title id>/romfs_ext/<virtual path>
 ```
 
-`<title id>` is 16 uppercase hex digits. For title `0400486024DEC000` the load folder
-is `<eden>/load/0400486024DEC000/` and the SD folder is
+`<title id>` is 16 uppercase hex digits of the id the NUP loader boots. For a base
+plus update container that is the base application id, not the update id ending in
+`800`. Title id 0 and ids ending in `800` have no mod root. For `0400486024DEC000`
+the load folder is `<eden>/load/0400486024DEC000/` and the SD folder is
 `<eden>/sdmc/atmosphere/contents/0400486024DEC000/`.
 
-`romfs`, `romfslite`, and `romfs_ext` are matched without case. `<virtual path>` is
-the path under the exported `romfs` directory. An example, not a path taken from a
-game: a dumped file `dump/0400486024DEC000/romfs/UI/A.bntx` would be overridden by
-`<eden>/load/0400486024DEC000/xbox-icons/romfs/UI/A.bntx` or by
-`<eden>/sdmc/atmosphere/contents/0400486024DEC000/romfs/UI/A.bntx` only once LayeredFS
-is applied to NUP.
+On Windows, `<eden>` is `<folder of lichii.exe>\user` when that `user` directory
+exists, otherwise `%APPDATA%\eden`. Give a test build its own empty `user` directory
+beside `lichii.exe` before the first launch so it does not open an existing profile.
 
-When several of those directories contain the same file, `PatchManager::ApplyLayeredFS`
-sorts the mod folders by name and uses the first match. The original file is used only
-when no layer has that path. A mod whose folder name is listed in that title's disabled
-add-ons is skipped. The disabled name `SDMC` skips the SD card layer. `romfs_ext` is
-packed as the RomFS extension section, separate from `romfs`.
+Precedence:
 
-`Dump RomFS to SDMC` writes into `<SDMC>/atmosphere/contents/<title id>/romfs/`, which
-is the SD override directory above. That dump is a copy of the exported tree. It does
-not modify the NUP, and a running NUP still does not read it.
+- The merged NUP image is the lowest layer. A path with no override stays as the
+  newest update left it, or the base file when the update has no such path.
+- Named load mods and the Atmosphere title folder are sorted by directory name in
+  byte order. The earlier name wins when both contain the same path.
+- The Atmosphere folder's name is the title id. A title id that starts with a digit
+  sorts before a mod folder named with a letter, so that Atmosphere file wins over
+  that named mod. Use one location for a one-file test.
+- Disabling a mod uses its folder name. Disabling the name `SDMC` skips the
+  Atmosphere layer. The next launch reads the packed file again.
+- `..` in a host path is collapsed and rejected when it would leave the directory
+  being opened. A symlink whose target resolves outside that directory is omitted.
+  This path does not open the NUP or a save for writing.
+
+Synthetic fixtures prove this through `RomFSFactory::OpenCurrentProcess`. A retail
+game boot has not.
+
+An example, not a path taken from a game: a dumped file
+`dump/0400486024DEC000/romfs/UI/A.bntx` is overridden by one of
+
+```text
+<eden>/load/0400486024DEC000/IconTest/romfs/UI/A.bntx
+<eden>/sdmc/atmosphere/contents/0400486024DEC000/romfs/UI/A.bntx
+```
+
+`Dump RomFS to SDMC` writes the unmodified packed tree into the Atmosphere directory.
+Move that copy aside before testing one replacement, or the title-id folder and a
+named mod compete by the sort above.

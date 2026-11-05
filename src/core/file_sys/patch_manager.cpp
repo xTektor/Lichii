@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/hex_util.h"
@@ -610,10 +611,15 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     }
 
     const auto disabled = GetDisabledAddons();
-    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();
-    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
+    std::vector<VirtualDir> patch_dirs;
+    if (load_dir != nullptr) {
+        patch_dirs = load_dir->GetSubdirectories();
+    }
+    if (sdmc_load_dir != nullptr &&
+        std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
         patch_dirs.push_back(sdmc_load_dir);
     }
+    std::erase(patch_dirs, nullptr);
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
@@ -622,7 +628,8 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
     for (const auto& subdir : patch_dirs) {
-        if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend()) {
+        if (subdir == nullptr ||
+            std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend()) {
             continue;
         }
 

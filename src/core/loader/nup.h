@@ -40,6 +40,10 @@ public:
 
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
 
+    /// Layers enabled RomFS mods onto the merged base+newest-update image. Load calls this
+    /// before the process RomFS is published. A second call keeps the first result.
+    ResultStatus ApplyRomFSOverrides(Core::System& system);
+
     ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) override;
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) override;
@@ -61,6 +65,8 @@ private:
     std::string display_title;
     std::string display_version;
     bool has_program{};
+    /// Merged RomFS after LayeredFS. Empty until ApplyRomFSOverrides succeeds.
+    FileSys::VirtualFile layered_romfs;
 };
 
 } // namespace Loader

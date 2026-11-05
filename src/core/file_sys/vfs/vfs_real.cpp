@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <iterator>
 #include <utility>
 #include "common/assert.h"
@@ -66,6 +67,34 @@ bool IsWithinRoot(std::string_view root, std::string_view full_path) {
         return false;
 
     return full_path.size() == root.size() || full_path[root.size()] == '/' || full_path[root.size()] == '\\';
+}
+
+/// A symlink is readable only when its target stays inside `root`. Other files are unchanged.
+bool SymlinkTargetInside(const std::string& root, const std::filesystem::path& candidate) {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const auto link = fs::symlink_status(candidate, error);
+    if (error || !fs::is_symlink(link)) {
+        return true;
+    }
+    const auto root_path = fs::weakly_canonical(fs::path{FS::ToU8String(root)}, error);
+    if (error) {
+        return false;
+    }
+    const auto target = fs::weakly_canonical(candidate, error);
+    if (error) {
+        return false;
+    }
+    const auto relative = target.lexically_relative(root_path);
+    if (relative.empty()) {
+        return false;
+    }
+    for (const auto& part : relative) {
+        if (part == "..") {
+            return false;
+        }
+    }
+    return true;
 }
 
 constexpr FS::FileAccessMode ModeFlagsToFileAccessMode(OpenMode mode) {
@@ -397,6 +426,9 @@ std::vector<VirtualFile> RealVfsDirectory::IterateEntries<RealVfsFile, VfsFile>(
 
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
+        if (!SymlinkTargetInside(path, entry.path())) {
+            return true;
+        }
         const auto full_path_string = FS::PathToUTF8String(entry.path());
 
         out.emplace_back(base.OpenFileFromEntry(full_path_string, entry.file_size(), perms));
@@ -419,6 +451,9 @@ std::vector<VirtualDir> RealVfsDirectory::IterateEntries<RealVfsDirectory, VfsDi
 
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
+        if (!SymlinkTargetInside(path, entry.path())) {
+            return true;
+        }
         const auto full_path_string = FS::PathToUTF8String(entry.path());
 
         out.emplace_back(base.OpenDirectory(full_path_string, perms));
@@ -445,7 +480,8 @@ RealVfsDirectory::~RealVfsDirectory() = default;
 VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     if (!FS::Exists(full_path) || FS::IsDir(full_path)
-        || !IsWithinRoot(FS::SanitizePath(path), full_path)) {
+        || !IsWithinRoot(FS::SanitizePath(path), full_path) ||
+        !SymlinkTargetInside(path, std::filesystem::path{FS::ToU8String(full_path)})) {
         return nullptr;
     }
     return base.OpenFile(full_path, perms);
@@ -454,7 +490,8 @@ VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) co
 VirtualDir RealVfsDirectory::GetDirectoryRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     if (!FS::Exists(full_path) || !FS::IsDir(full_path)
-        || !IsWithinRoot(FS::SanitizePath(path), full_path)) {
+        || !IsWithinRoot(FS::SanitizePath(path), full_path) ||
+        !SymlinkTargetInside(path, std::filesystem::path{FS::ToU8String(full_path)})) {
         return nullptr;
     }
     return base.OpenDirectory(full_path, perms);
