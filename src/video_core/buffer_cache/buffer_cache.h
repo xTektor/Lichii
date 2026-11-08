@@ -785,12 +785,14 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     }
     channel_state->enabled_compute_storage_buffers = 0;
     channel_state->written_compute_storage_buffers = 0;
+    channel_state->native_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
 
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                              bool is_written, u32 indirect_offset) {
+                                              bool is_written, u32 indirect_offset,
+                                              const Shader::StorageWriteExtent& write_extent) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -827,20 +829,50 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     const auto& cbufs = launch_desc.const_buffer_config;
     GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     GPUVAddr holder{};
-    if (indirect_offset != ~0U) {
+    const bool table_pointer = indirect_offset != ~0U;
+    if (table_pointer) {
         holder = gpu_memory->Read<u64>(ssbo_addr);
-        if (holder == 0) {
-            channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
-            return;
-        }
         ssbo_addr = holder + indirect_offset;
     }
-    channel_state->compute_storage_buffers[ssbo_index] = StorageBufferBinding(
-        ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(), indirect_offset != ~0U);
-    if (indirect_offset != ~0U) {
+    const bool native_pointer = kepler_compute->IsNativeMode();
+    channel_state->native_compute_storage_buffers =
+        (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
+        ((native_pointer ? u64{1} : u64{0}) << ssbo_index);
+    const Binding binding =
+        table_pointer && holder == 0
+            ? NULL_BINDING
+            : StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer, table_pointer);
+    channel_state->compute_storage_buffers[ssbo_index] = binding;
+    if (table_pointer && holder != 0) {
         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
-                          channel_state->compute_storage_buffers[ssbo_index]);
+                          binding);
     }
+
+    // A native pointer has no size, so the binding is up to 8 MiB past it. Marking all of that
+    // GPU-written defers the CPU's later writes to those pages until the next fence (Ocarina of
+    // Time's exposure and foliage records sit next to the skinning output) and makes every fence
+    // copy the over-marked range back. Mark only the bytes the shader's stores can reach. The
+    // binding keeps its size, so the shader can still read the rest. An unproven extent marks the
+    // whole binding, which is the previous behaviour.
+    u64 mark = binding.size;
+    if (native_pointer && is_written && binding.size != 0 && write_extent.bounded) {
+        const std::array<u32, 3> block{launch_desc.block_dim_x.Value(),
+                                       launch_desc.block_dim_y.Value(),
+                                       launch_desc.block_dim_z.Value()};
+        std::optional<std::array<u32, 3>> grid;
+        if (!kepler_compute->GetIndirectComputeAddress()) {
+            grid = std::array<u32, 3>{launch_desc.grid_dim_x.Value(), launch_desc.grid_dim_y.Value(),
+                                      launch_desc.grid_dim_z.Value()};
+        }
+        if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
+            // The extent counts from the pointer. The binding starts at the pointer aligned down.
+            const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+            const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+            mark = std::min<u64>(binding.size, pad + *extent);
+        }
+    }
+    channel_state->compute_storage_write_marks[ssbo_index] =
+        static_cast<u32>(std::min<u64>(mark, (std::numeric_limits<u32>::max)()));
 }
 
 template <class P>
@@ -1540,7 +1572,8 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
 
 template <class P>
 bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_written,
-                                           std::span<const MultiRangeSegment> pool) {
+                                           std::span<const MultiRangeSegment> pool,
+                                           u64 write_mark_limit) {
     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
         if (binding.segment_count < 2) {
             return false;
@@ -1563,8 +1596,13 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             SynchronizeBuffer(buffer, segment.device_addr, segment.size);
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
-            if (is_written) {
-                MarkWrittenBuffer(segment.buffer_id, segment.device_addr, segment.size);
+            if (is_written && write_mark_limit != 0) {
+                // write_mark_limit is the native write mark, spread over the segments in order.
+                const u32 mark = static_cast<u32>(std::min<u64>(segment.size, write_mark_limit));
+                MarkWrittenBuffer(segment.buffer_id, segment.device_addr, mark);
+                if (write_mark_limit != ~u64{0}) {
+                    write_mark_limit -= mark;
+                }
             }
             runtime.PushMultiRangeSource(buffer, offset, segment.size);
         }
@@ -1727,7 +1765,13 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const Binding& binding = channel_state->compute_storage_buffers[index];
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-        if (BindMultiRangeStorage(binding, is_written, compute_segments)) {
+        // A native program's binding is min(layout, 8 MiB) because its pointer has no size.
+        // Mark only what BindComputeStorageBuffer proved the dispatch can write. The binding
+        // keeps its size so the shader can still read all of it.
+        const bool native = ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+        const u64 write_mark_limit =
+            native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
+        if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -1738,8 +1782,9 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
-        if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
+        const u32 mark = is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
+        if (mark != 0) {
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
