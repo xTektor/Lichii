@@ -160,6 +160,9 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    /// Waits until the back has executed `position` (clamped to what was sent). A queued semaphore
+    /// release is waited for without also waiting for state methods queued after it.
+    bool WaitUntilConsumed(u64 position, DrainSite site);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
