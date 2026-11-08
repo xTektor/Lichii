@@ -55,6 +55,13 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 
 DmaPusher::~DmaPusher() = default;
 
+bool DmaPusher::CanResumeAcquire() {
+    if (pending_list_tick) {
+        return rasterizer != nullptr && rasterizer->IsGpuTickDone(*pending_list_tick);
+    }
+    return puller.CanResumeAcquire(*this);
+}
+
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
@@ -79,6 +86,19 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    // Waiting for the GPU copy of a command list this channel reads next.
+    if (pending_list_tick) {
+        if (rasterizer == nullptr || !rasterizer->IsGpuTickDone(*pending_list_tick)) {
+            return false;
+        }
+        pending_list_tick.reset();
+        list_read_resume.Arm();
+    }
+    // Only the entry that suspended may skip its writer wait. An acquire that is still waiting,
+    // or any return before the list read, must not leave the flag set.
+    SCOPE_EXIT {
+        list_read_resume.Clear();
+    };
     const u64 suspensions_before = suspensions.load(std::memory_order_relaxed);
     if (!puller.ResumeAcquire(*this)) {
         return false;
@@ -230,7 +250,14 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+        } else if (bool pending = false;
+                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
+                                          &pending) ||
+                   pending) {
+            if (pending) {
+                // Parsed again once the GPU copied the list. Other channels run meanwhile.
+                return false;
+            }
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
@@ -610,7 +637,7 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
-bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending) {
     // The pages are marked as command list pages: from the next write on, the buffer cache copies
     // them to host memory right after the dispatch or copy that writes them and submits. The
     // front then waits only for the back to run that work and for the GPU to finish the copy, not
@@ -635,7 +662,10 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         return false;
     }
     auto& split = VideoCommon::GpuSplit::Get();
-    if (split.Active()) {
+    // Resuming after the copy's tick: the writer wait already ran, and waiting again would also
+    // wait for other channels' work queued during the suspension.
+    const bool resumed = list_read_resume.Consume();
+    if (split.Active() && !resumed) {
         split.WaitForWriters();
     }
     bool past_sync = !split.Active();
@@ -651,7 +681,9 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         }
         GpuWrittenList where = GpuWrittenList::Synced;
         if (Tegra::Nx2IsGpuWritten(*device)) {
-            where = rasterizer->ReadGpuWrittenCommandList(*device, part, past_sync);
+            u64 tick = 0;
+            u64* const pending_tick = pending != nullptr ? &tick : nullptr;
+            where = rasterizer->ReadGpuWrittenCommandList(*device, part, past_sync, pending_tick);
             if (where == GpuWrittenList::NeedsSync) {
                 const auto wait_start = Nx2CmdPageDiag::g_enabled
                                             ? std::chrono::steady_clock::now()
@@ -661,7 +693,14 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
                     Nx2CmdPageDiag::NoteSyncWait(std::chrono::steady_clock::now() - wait_start);
                 }
                 past_sync = true;
-                where = rasterizer->ReadGpuWrittenCommandList(*device, part, true);
+                where = rasterizer->ReadGpuWrittenCommandList(*device, part, true, pending_tick);
+            }
+            if (where == GpuWrittenList::Pending) {
+                pending_list_tick = tick;
+                if (pending != nullptr) {
+                    *pending = true;
+                }
+                return false;
             }
             if (Nx2CmdPageDiag::g_enabled) {
                 auto& diag = Nx2CmdPageDiag::Get();

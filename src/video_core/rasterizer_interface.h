@@ -115,11 +115,21 @@ public:
         /// Draws write the page: ask again with `past_sync` once the split's back ran the work
         /// before the last host-level wait (GpuSplit::WaitForSync)
         NeedsSync,
+        /// Only with `pending_tick`: the copy is not done yet. `*pending_tick` completes it.
+        Pending,
     };
+    /// With `pending_tick`, a copy the GPU is still making returns Pending instead of waiting.
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
                                                      [[maybe_unused]] std::span<u8> out,
-                                                     [[maybe_unused]] bool past_sync) {
+                                                     [[maybe_unused]] bool past_sync,
+                                                     [[maybe_unused]] u64* pending_tick = nullptr) {
         return GpuWrittenList::Unknown;
+    }
+
+    /// Whether the host GPU passed `tick`, without waiting. Asks for deferred work to be
+    /// submitted when the tick is not submitted yet, so it can complete.
+    virtual bool IsGpuTickDone([[maybe_unused]] u64 tick) {
+        return true;
     }
 
     /// Switch 2: the front flushed this command list page with the split drained.
