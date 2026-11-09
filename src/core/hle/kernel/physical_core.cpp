@@ -7,6 +7,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -35,10 +38,10 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
     const auto EnterContext = [&]() {
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        KScopedSpinLock lk{m_guard};
 
         // Check if we are already interrupted. If we are, we can just stop immediately.
-        if (m_is_interrupted) {
+        if (m_is_interrupted.load() != 0) {
             return false;
         }
 
@@ -66,7 +69,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         interface->UnlockThread(thread);
 
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        KScopedSpinLock lk{m_guard};
 
         // On exit, we no longer are running.
         m_arm_interface = nullptr;
@@ -245,45 +248,48 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
         const auto deadline = std::chrono::steady_clock::now() + spin;
-        while (!m_is_interrupted.load(std::memory_order_acquire) &&
+        while (m_is_interrupted.load(std::memory_order_acquire) == 0 &&
                std::chrono::steady_clock::now() < deadline) {
+            // PAUSE rather than a yield: no system call per iteration, and the SMT sibling (often
+            // a GPU thread) keeps most of the core.
+#if defined(_M_X64) || defined(__x86_64__)
+            for (int i = 0; i < 8; ++i) {
+                _mm_pause();
+            }
+#else
             std::this_thread::yield();
+#endif
         }
     }
-    std::unique_lock lk{m_guard};
-    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+    while (m_is_interrupted.load(std::memory_order_acquire) == 0) {
+        m_is_interrupted.wait(0, std::memory_order_acquire);
+    }
 }
 
 bool PhysicalCore::IsInterrupted() const {
-    return m_is_interrupted;
+    return m_is_interrupted.load() != 0;
 }
 
 void PhysicalCore::Interrupt() {
-    // Lock core context.
-    std::scoped_lock lk{m_guard};
+    {
+        // Lock core context.
+        KScopedSpinLock lk{m_guard};
 
-    // Load members.
-    auto* arm_interface = m_arm_interface;
-    auto* thread = m_current_thread;
+        // Add interrupt flag.
+        m_is_interrupted.store(1, std::memory_order_seq_cst);
 
-    // Add interrupt flag.
-    m_is_interrupted = true;
-
-    // Interrupt ourselves.
-    m_on_interrupt.notify_one();
-
-    // If there is no thread running, we are done.
-    if (arm_interface == nullptr) {
-        return;
+        // If a thread is running, interrupt the CPU.
+        if (m_arm_interface != nullptr) {
+            m_arm_interface->SignalInterrupt(m_current_thread);
+        }
     }
-
-    // Interrupt the CPU.
-    arm_interface->SignalInterrupt(thread);
+    // Wake Idle if it sleeps.
+    m_is_interrupted.notify_all();
 }
 
 void PhysicalCore::ClearInterrupt() {
-    std::scoped_lock lk{m_guard};
-    m_is_interrupted = false;
+    KScopedSpinLock lk{m_guard};
+    m_is_interrupted = 0;
 }
 
 } // namespace Kernel

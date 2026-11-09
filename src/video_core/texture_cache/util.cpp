@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
@@ -28,15 +29,18 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/textures/unswizzle_worker.h"
 
 namespace VideoCommon {
 
@@ -850,11 +854,9 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
-boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::MemoryManager& gpu_memory,
-                                                                   GPUVAddr gpu_addr,
-                                                                   const ImageInfo& info,
-                                                                   std::span<const u8> input,
-                                                                   std::span<u8> output) {
+boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
+    Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+    std::span<const u8> input, std::span<u8> output, Tegra::Texture::UnswizzleWorker* worker) {
     const size_t guest_size_bytes = input.size_bytes();
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
@@ -919,8 +921,16 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
-            UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
-                             num_tiles.depth, block.height, block.depth, stride_alignment, gpu_memory.UsesNativeTiling());
+            if (!worker ||
+                info.type != ImageType::e2D || info.num_samples != 1 ||
+                !worker->TryUnswizzle(
+                    dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,
+                    num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth,
+                    stride_alignment, gpu_memory.UsesNativeTiling(), Nx2Perf::Verify())) {
+                UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
+                                 num_tiles.depth, block.height, block.depth, stride_alignment,
+                                 gpu_memory.UsesNativeTiling());
+            }
             guest_layer_offset += layer_stride;
             host_offset += host_bytes_per_layer;
         }
@@ -1298,6 +1308,23 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
     }
 }
 
+u64 TranscodeKey(std::span<const u8> input, const ImageInfo& info, size_t out_size) {
+    const std::array<u64, 6> layout{
+        static_cast<u64>(info.format) | (static_cast<u64>(info.type) << 16) |
+            (static_cast<u64>(Settings::GetAstcRecompression()) << 24) |
+            (u64{info.astc_opaque} << 32),
+        u64{info.size.width} | (u64{info.size.height} << 32),
+        u64{info.size.depth},
+        static_cast<u64>(info.resources.levels) | (static_cast<u64>(info.resources.layers) << 32),
+        static_cast<u64>(out_size),
+        static_cast<u64>(input.size()),
+    };
+    const u64 data_hash =
+        Common::CityHash64(reinterpret_cast<const char*>(input.data()), input.size());
+    return Common::CityHash64WithSeed(reinterpret_cast<const char*>(layout.data()),
+                                      sizeof(layout), data_hash);
+}
+
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies) {
     u32 output_offset = 0;
@@ -1472,6 +1499,16 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                   Common::ScratchBuffer<u8>& tmp_buffer) {
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
+        const u32 levels =
+            info.num_samples > 1
+                ? 1
+                : HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                    static_cast<u32>(info.resources.levels));
+        if (!IsHostMipLevel(copy.image_subresource.base_level, levels)) {
+            // The host did not download this tail level. Preserve the guest bytes.
+            continue;
+        }
+
         if (is_pitch_linear) {
             SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
         } else {

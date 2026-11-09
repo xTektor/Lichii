@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,12 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 // 128 MiB on Windows too: 256 MiB sat mostly unused in device memory on Switch 2 titles.
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 #endif
+
+// Unused space after the end of the stream buffer. Constant buffers are bound from it and the
+// shaders declare each one at its full 64 KiB, so Metal checks 64 KiB from the binding offset
+// against the end of the buffer ("argument c3[0] ... has space for 26624 bytes, but argument has a
+// length(65536)"). The tail is never handed out, so every binding has the full 64 KiB behind it.
+constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
 
 size_t GetStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
@@ -88,7 +95,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = stream_buffer_size,
+        .size = stream_buffer_size + STREAM_BUFFER_TAIL,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -135,6 +142,23 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+
+    // Every 600 frames with EDEN_NX2_TC_LOG: the memory the staging buffers keep.
+    static const bool log_memory = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+    if (log_memory && ++log_frames % 600 == 0) {
+        const auto total = [](const StagingBuffersCache& cache) {
+            u64 bytes = 0;
+            for (size_t level = 0; level < NUM_LEVELS; ++level) {
+                bytes += (u64{1} << level) * cache[level].entries.size();
+            }
+            return bytes;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Staging buffers: device-local {} MiB, upload {} MiB, download {} MiB, stream {} "
+                 "MiB",
+                 total(device_local_cache) >> 20, total(upload_cache) >> 20,
+                 total(download_cache) >> 20, stream_buffer_size >> 20);
+    }
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
@@ -225,7 +249,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .size = 1ULL << log2_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, // mesh emulation dispatch and draw arguments
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -282,6 +307,24 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
+
+    // Keep two idle upload buffers per level up to 32 MiB (under 128 MiB in all). Each level is
+    // swept every 64 frames, so after a pause each upload over 8 MiB (past the stream buffer's
+    // regions) got a new dedicated allocation, written to for the first time (16 MiB on an
+    // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
+    constexpr size_t KeepMaxLog2 = 25;
+    constexpr size_t KeepPerLevel = 2;
+    if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+        size_t idle = 0;
+        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        });
+        staging.delete_index = 0;
+        if (staging.iterate_index > entries.size()) {
+            staging.iterate_index = 0;
+        }
+        return;
+    }
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
         return scheduler.IsFree(entry.tick);

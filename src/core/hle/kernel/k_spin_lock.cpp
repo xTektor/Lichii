@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "core/hle/kernel/k_spin_lock.h"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -11,8 +13,9 @@ namespace Kernel {
 
 namespace {
 
-// Spins of about 30-140 cycles each before a contended Lock sleeps (a few microseconds).
-constexpr int SpinCount = 128;
+// How long a contended Lock spins before it sleeps. Holders keep the lock for a few microseconds,
+// and sleeping costs the waiter the host's wake-up latency and the holder a wake system call.
+constexpr std::chrono::microseconds SpinBudget{20};
 
 void Pause() {
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -30,7 +33,8 @@ void KSpinLock::Lock() {
                                         std::memory_order_relaxed)) {
         return;
     }
-    for (int spin = 0; spin < SpinCount; ++spin) {
+    const auto deadline = std::chrono::steady_clock::now() + SpinBudget;
+    for (u32 spin = 1;; ++spin) {
         Pause();
         if (m_state.load(std::memory_order_relaxed) == 0) {
             expected = 0;
@@ -38,6 +42,9 @@ void KSpinLock::Lock() {
                                               std::memory_order_relaxed)) {
                 return;
             }
+        }
+        if ((spin & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            break;
         }
     }
     // Mark the lock contended and sleep until it is released; taken this way it stays marked,

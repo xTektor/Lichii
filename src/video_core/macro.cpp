@@ -1365,7 +1365,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below);
         // filled only for calls that are interpreted.
         auto& fifo = native_fifo;
-        native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
+        // The channel's data RAM is the split's front's while it runs macros (split_writes).
+        native_interpreter.active_dram =
+            split_writes != nullptr ? &native_interpreter.dram : &maxwell3d.GetNativeDataRam();
         // EDEN_NX2_MME_RECORD=<file>: write the first 200000 calls (u32 start, u32 count, the
         // parameters) and then the macro code to <file>.code, to check interpreter changes
         // offline against the previous interpreter. EDEN_NX2_MME_RECORD_SKIP=<n>: skip the first
@@ -1396,6 +1398,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         bool read_memory = false;
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
+                if (split_writes != nullptr && !(*split_writes)[address]) [[unlikely]] {
+                    ++split_unexpected_writes;
+                }
                 if (address == 0x556) {
                     // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
                     // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
@@ -1435,8 +1440,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
-                    // fence: write them out, or occlusion predicates read stale values. The split only
-                    // runs with immediate payload writes, and the query cache belongs to its back.
+                    // fence: write them out, or occlusion predicates read stale values.
                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
                                              VideoCommon::GpuSplit::OnBackThread();
                     if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
@@ -1445,8 +1449,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
                                                      source, read_bytes);
                     }
-                    if (!VideoCommon::GpuSplit::Get().Active()) {
-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                    if (owns_caches) {
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
                     }
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);

@@ -3,13 +3,17 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "common/common_types.h"
 
@@ -39,13 +43,17 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    ListCopies,     ///< Lists on GPU-written pages: writers before the last host sync
+    BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
+    BackCode,       ///< The macro code changes under the macros the back has yet to run
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "gp sync fence", "map",           "front start", "front verify", "list copy writers",
+    "back register", "back code",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -134,6 +142,23 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
     }
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    template <typename Func>
+    void DeferWords(const Func& func, std::span<const u32> words) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        entry[2 + function_words] = words.size();
+        if (!words.empty()) {
+            entry[1 + payload] = 0; // Padding after an odd count
+            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
+        }
+        Commit(2 + payload);
+    }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
@@ -157,6 +182,9 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    /// Waits until the back has executed `position` (clamped to what was sent). A queued semaphore
+    /// release is waited for without also waiting for state methods queued after it.
+    bool WaitUntilConsumed(u64 position, DrainSite site);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -164,7 +192,91 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
+    /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
+    /// report, a semaphore release). size ~0 means an unknown range.
+    void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
+        PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+        write.what = what;
+        write.begin = begin;
+        write.end = size == ~u64{0} ? ~u64{0} : begin + size;
+        write.position = write_position;
+        write.words = 0;
+    }
+    /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
+    /// linear inline upload data): reads overlay them instead of waiting.
+    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        while (words != 0) {
+            const u32 count = (std::min<u32>)(words, PendingWriteWords);
+            PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+            write.what = "known";
+            write.begin = begin;
+            write.end = begin + u64{count} * sizeof(u32);
+            write.position = write_position;
+            write.words = count;
+            std::memcpy(write.data.data(), data, count * sizeof(u32));
+            begin += u64{count} * sizeof(u32);
+            data += count;
+            words -= count;
+        }
+    }
+    /// The back's position. Take it before reading guest memory for OverlayQueuedWrites.
+    [[nodiscard]] u64 ConsumedNow() {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// Applies to `out` (the words at device address `begin`, read from guest memory after
+    /// `since`) the queued writes the front knows the words of. False when an overlapping queued
+    /// write's words are unknown, or more writes are queued than are remembered.
+    bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
+    /// Waits until the back executed the noted writes that overlap [begin, begin + size).
+    /// Returns false when more writes are queued than are remembered (the caller drains).
+    bool WaitForWritesTo(u64 begin, u64 size);
+    /// A write that lands when a host query completes or a fence signals, not when the back runs it.
+    void NoteAsyncWrite(u64 begin, u64 size) {
+        NoteReportWrite(begin, size);
+        if (size == 0) {
+            return;
+        }
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            async_writes[slot] = write_position;
+        }
+    }
+    /// A fence release with a known payload. Below GPU accuracy High the query cache writes it
+    /// when its host fence signals, after the back ran it.
+    void NoteFenceWrite(u64 begin, u32 payload) {
+        NoteMemoryWriteData(begin, &payload, 1);
+        NoteReportWrite(begin, 4);
+        fence_writes[begin >> 4] = write_position;
+    }
+    /// Whether these bytes lie on 4 KiB pages reports or semaphore releases write. Draws and
+    /// dispatches do not write those pages.
+    [[nodiscard]] bool IsReportMemory(u64 begin, u64 size) const {
+        if (size == 0) {
+            return false;
+        }
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            if (!report_pages.contains(page)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    void NoteReportWrite(u64 begin, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            report_pages.insert(page);
+        }
+    }
+    /// Ring position of the newest async write noted to these bytes, or 0.
+    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
+        return Newest(async_writes, begin, size);
+    }
+    /// Ring position of the newest fence release noted to these bytes, or 0.
+    [[nodiscard]] u64 HasFenceWrite(u64 begin, u64 size) const {
+        return Newest(fence_writes, begin, size);
+    }
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -174,8 +286,22 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Ring position of what the front has sent.
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// Whether the back has executed through `position`.
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
 
 private:
+    friend struct GpuSplitTestAccess;
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -187,6 +313,22 @@ private:
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
 
+    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+    std::unordered_map<u64, u64> fence_writes; ///< Front: 16-byte slot -> ring position
+    [[nodiscard]] static u64 Newest(const std::unordered_map<u64, u64>& writes, u64 begin, u64 size) {
+        u64 newest = 0;
+        if (writes.empty() || size == 0) {
+            return newest;
+        }
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            if (const auto it = writes.find(slot); it != writes.end()) {
+                newest = (std::max)(newest, it->second);
+            }
+        }
+        return newest;
+    }
+    std::unordered_set<u64> report_pages; ///< Front: 4 KiB pages reports and releases wrote
+
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
@@ -195,6 +337,13 @@ private:
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+    template <typename Func>
+    static void CallWordsThunk(const u64* payload) {
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        (*reinterpret_cast<const Func*>(payload))(
+            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
+                                 static_cast<size_t>(payload[function_words])});
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
@@ -222,8 +371,19 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
+    /// One step of a front wait for the back to consume `target`.
+    void Backoff(u32 spins, u64 target);
+    /// After the back stored `consumed`: wakes a front sleeping in Backoff.
+    void NotifyFront() {
+        if (front_waiting.load(std::memory_order_seq_cst)) {
+            front_wake.fetch_add(1, std::memory_order_seq_cst);
+            front_wake.notify_one();
+        }
+    }
+
     void BackLoop(std::stop_token stop_token);
-    size_t Execute(const u64* entry);
+    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
+    size_t Execute(const u64* entry, size_t words);
 
     Core::System* system{};
     bool active{};
@@ -233,6 +393,17 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    static constexpr u32 PendingWriteWords = 8;
+    struct PendingWrite {
+        u64 begin{};
+        u64 end{};
+        u64 position{};
+        u32 words{}; ///< Known words from begin, or 0 when the contents are unknown
+        const char* what{};
+        std::array<u32, PendingWriteWords> data{};
+    };
+    std::array<PendingWrite, 8192> pending_writes{};
+    u64 pending_write_count{};
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};
@@ -258,6 +429,9 @@ private:
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
+    /// The front sleeps in Backoff (#161: instead of yielding).
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
     std::jthread back_thread;
 };
 
