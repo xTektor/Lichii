@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -43,6 +44,8 @@ enum class DrainSite : u32 {
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     ListCopies,     ///< Lists on GPU-written pages: writers before the last host sync
+    BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
+    BackCode,       ///< The macro code changes under the macros the back has yet to run
     Count,
 };
 
@@ -50,6 +53,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify", "list copy writers",
+    "back register", "back code",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -136,6 +140,23 @@ public:
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
+        Commit(2 + payload);
+    }
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    template <typename Func>
+    void DeferWords(const Func& func, std::span<const u32> words) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        entry[2 + function_words] = words.size();
+        if (!words.empty()) {
+            entry[1 + payload] = 0; // Padding after an odd count
+            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
+        }
         Commit(2 + payload);
     }
     void DeferFunction(std::function<void()>&& func);
@@ -316,6 +337,13 @@ private:
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+    template <typename Func>
+    static void CallWordsThunk(const u64* payload) {
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        (*reinterpret_cast<const Func*>(payload))(
+            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
+                                 static_cast<size_t>(payload[function_words])});
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).

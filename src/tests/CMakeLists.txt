@@ -47,6 +47,7 @@ add_executable(tests
     video_core/semaphore_acquire.cpp
     video_core/list_read_resume.cpp
     video_core/command_entry_wait.cpp
+    video_core/turing_macro_effects.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
     input_common/calibration_lifetime.cpp
