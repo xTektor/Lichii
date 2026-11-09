@@ -52,6 +52,16 @@
 
 namespace Kernel {
 
+namespace {
+
+// Plain (constinit, trivially destructible) copies of the hot fields of ThreadLocalData, which holds
+// an optional KThread, so every access to it goes through the TLS wrapper and its guard. SVCs,
+// scheduler locks and memory traps read the current thread and the host thread ID many times each.
+constinit thread_local KThread* t_current_thread = nullptr;
+constinit thread_local u8 t_host_thread_id = UINT8_MAX;
+
+} // Anonymous namespace
+
 // Can only be used by a single implementation PER THREAD
 struct ThreadLocalData {
     std::optional<KThread> raw_thread;
@@ -386,12 +396,13 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
+        t_host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
-        return tls_data.host_thread_id;
+        return t_host_thread_id;
     }
 
     // Gets the dummy KThread for the caller, allocating a new one if this is the first time
@@ -442,11 +453,19 @@ struct KernelCore::Impl {
     }
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
-        return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
+        if (KThread* const cached = t_current_thread; cached != nullptr) [[likely]] {
+            return cached;
+        }
+        if (t.current_thread == nullptr) {
+            t.current_thread = GetHostDummyThread(t, nullptr);
+        }
+        t_current_thread = t.current_thread;
+        return t.current_thread;
     }
 
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
+        t_current_thread = thread;
     }
 
     void DeriveInitialMemoryLayout() {

@@ -742,7 +742,11 @@ struct Memory::Impl {
                     return GetPointerFromDebugMemory(vaddr);
                 case Common::PageType::RasterizerCachedMemory: {
                     u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
-                    on_rasterizer();
+                    if constexpr (std::is_invocable_v<G&, u8*>) {
+                        on_rasterizer(host_ptr);
+                    } else {
+                        on_rasterizer();
+                    }
                     return host_ptr;
                 }
                 case Common::PageType::Unmapped: [[unlikely]] {
@@ -807,9 +811,9 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x} (#{})", sizeof(T) * 8, addr, count);
             }
             ++UnmappedReadFlag();
-        }, [&]() {
+        }, [&](u8* host_ptr) {
             if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
-                HandleRasterizerDownload(addr, sizeof(T));
+                HandleRasterizerDownload(addr, sizeof(T), host_ptr);
             }
         }); ptr) [[likely]] {
             // It may be tempting to rewrite this particular section to use "reinterpret_cast";
@@ -830,7 +834,7 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
+        }, [&](u8* host_ptr) { HandleRasterizerWrite(addr, sizeof(T), host_ptr); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
     }
 
@@ -880,9 +884,11 @@ struct Memory::Impl {
                   static_cast<u32>(raw.type), static_cast<u32>(raw.block));
     }
 
-    void HandleRasterizerDownload(VAddr v_address, size_t size) {
-        const auto* p = GetPointerImpl(
-            v_address, []() {}, []() {});
+    void HandleRasterizerDownload(VAddr v_address, size_t size, const u8* known_pointer = nullptr) {
+        // The trapping access already looked the host pointer up.
+        const u8* const p = known_pointer != nullptr ? known_pointer
+                                                     : GetPointerImpl(
+                                                           v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
@@ -904,29 +910,43 @@ struct Memory::Impl {
             });
             return;
         }
-        auto& current_area = rasterizer_read_areas[core];
+        auto& areas = rasterizer_read_areas[core];
         if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
             read_area_generations[core] != generation) {
-            current_area = {};
+            areas = {};
             read_area_generations[core] = generation;
         }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
-            if (current_area.start_address <= address && end_address <= current_area.end_address)
-                [[likely]] {
+            if (areas.Contains(address, end_address)) [[likely]] {
                 return;
             }
             DisarmReadTraps(v_address, size);
-            current_area = system.GPU().OnCPURead(address, size);
+            areas.Insert(system.GPU().OnCPURead(address, size));
         });
     }
 
-    void HandleRasterizerWrite(VAddr v_address, size_t size) {
-        const auto* p = GetPointerImpl(
-            v_address, []() {}, []() {});
-        constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
-        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                     sys_core); // any other calls threads go to syscore.
+    /// The write tracking slot of the calling thread, and whether it is shared (sys_core_guard).
+    /// Threads that are not guest cores share the slot after the cores': they used to share the
+    /// last core's, so that core took a mutex on every trapped write.
+    std::pair<size_t, bool> WriteSlot() const {
+        constexpr size_t num_cores = Core::Hardware::NUM_CPU_CORES;
+        const size_t thread_id = system.GetCurrentHostThreadID();
+        if (gpu_dirty_managers.size() > num_cores) {
+            return {(std::min)(thread_id, num_cores), thread_id >= num_cores};
+        }
+        const size_t last_core = (std::min)(thread_id, num_cores - 1);
+        return {last_core, last_core == num_cores - 1};
+    }
+
+    void HandleRasterizerWrite(VAddr v_address, size_t size, const u8* known_pointer = nullptr) {
+        // The trapping access already looked the host pointer up.
+        const u8* const p = known_pointer != nullptr ? known_pointer
+                                                     : GetPointerImpl(
+                                                           v_address, []() {}, []() {});
+        const std::pair<size_t, bool> slot = WriteSlot();
+        const size_t core = slot.first;
+        const bool shared = slot.second;
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
@@ -934,16 +954,15 @@ struct Memory::Impl {
             ReportForeignPointer(v_address, p);
             return;
         }
-        // Guard on sys_core;
-        if (core == sys_core) [[unlikely]] {
+        if (shared) [[unlikely]] {
             sys_core_guard.lock();
         }
         SCOPE_EXIT {
-            if (core == sys_core) [[unlikely]] {
+            if (shared) [[unlikely]] {
                 sys_core_guard.unlock();
             }
         };
-        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+        const auto on_device_address = [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
@@ -961,7 +980,35 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+        };
+        // Most trapped writes land on the page the core already collects into: remember the
+        // device page of the last host page while the device mappings stay the same.
+        auto& translation = write_translations[core];
+        const uintptr_t host_address = reinterpret_cast<uintptr_t>(p);
+        const uintptr_t host_page = host_address >> YUZU_PAGEBITS;
+        const u64 mapping_generation = gpu_device_memory->MappingGeneration();
+        if (translation.host_page == host_page && translation.generation == mapping_generation)
+            [[likely]] {
+            on_device_address((DAddr{translation.device_page} << YUZU_PAGEBITS) |
+                              DAddr{host_address & YUZU_PAGEMASK});
+            return;
+        }
+        u32 count = 0;
+        DAddr last_address = 0;
+        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            ++count;
+            last_address = address;
+            on_device_address(address);
         });
+        if (count == 1) {
+            translation = WriteTranslation{
+                .host_page = host_page,
+                .device_page = last_address >> YUZU_PAGEBITS,
+                .generation = mapping_generation,
+            };
+        } else {
+            translation = WriteTranslation{};
+        }
     }
 
     struct GPUDirtyState {
@@ -969,18 +1016,17 @@ struct Memory::Impl {
     };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
-        constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
-        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                     sys_core); // any other calls threads go to syscore.
+        const std::pair<size_t, bool> slot = WriteSlot();
+        const size_t core = slot.first;
+        const bool shared = slot.second;
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
-        // Guard on sys_core;
-        if (core == sys_core) [[unlikely]] {
+        if (shared) [[unlikely]] {
             sys_core_guard.lock();
         }
         SCOPE_EXIT {
-            if (core == sys_core) [[unlikely]] {
+            if (shared) [[unlikely]] {
                 sys_core_guard.unlock();
             }
         };
@@ -993,14 +1039,44 @@ struct Memory::Impl {
     Tegra::MaxwellDeviceMemoryManager* gpu_device_memory{};
     Common::PageTable* current_page_table = nullptr;
 
-    std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
+    /// Areas where a core's reads of GPU-cached memory were found clean or were flushed, valid
+    /// until read_trap_generation moves.
+    struct ReadAreaCache {
+        std::array<VideoCore::RasterizerDownloadArea, 4> areas{};
+        size_t next{};
+
+        bool Contains(DAddr begin, DAddr end) const {
+            for (const auto& area : areas) {
+                if (area.start_address <= begin && end <= area.end_address) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void Insert(const VideoCore::RasterizerDownloadArea& area) {
+            areas[next] = area;
+            next = (next + 1) % areas.size();
+        }
+    };
+
+    /// A write slot's last host page and its only device page.
+    struct WriteTranslation {
+        uintptr_t host_page{~uintptr_t{0}};
+        DAddr device_page{};
+        u64 generation{};
+    };
+
+    std::array<ReadAreaCache, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
-    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
-    std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
+    // One slot per guest core and one for every other thread (WriteSlot).
+    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES + 1> rasterizer_write_areas{};
+    std::array<WriteTranslation, Core::Hardware::NUM_CPU_CORES + 1> write_translations{};
+    std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES + 1> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
 #ifdef __ANDROID__

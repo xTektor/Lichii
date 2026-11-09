@@ -7,12 +7,11 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <memory>
-#include <mutex>
 
 #include "core/arm/arm_interface.h"
+#include "core/hle/kernel/k_spin_lock.h"
 
 namespace Kernel {
 class KernelCore;
@@ -68,11 +67,14 @@ public:
 
 private:
     const std::size_t m_core_index;
-    std::mutex m_guard;
-    std::condition_variable m_on_interrupt;
+    // Held for a few instructions by RunThread and Interrupt, thousands of times a second: a
+    // std::mutex and condition variable cost the contended locks and every wake of an idle core a
+    // host synchronization round trip.
+    KSpinLock m_guard;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
-    std::atomic<bool> m_is_interrupted{};
+    /// 1 when interrupted; Idle waits on it.
+    std::atomic<u32> m_is_interrupted{};
     bool m_is_single_core{};
 };
 

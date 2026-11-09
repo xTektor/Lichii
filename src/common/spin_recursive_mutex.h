@@ -40,8 +40,10 @@ public:
             ++depth;
             return true;
         }
+        // A plain load first: a failed compare-exchange still takes the cache line from the owner.
         std::uint32_t expected = 0;
-        if (!state.compare_exchange_strong(expected, 1, std::memory_order_acquire,
+        if (state.load(std::memory_order_relaxed) != 0 ||
+            !state.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                            std::memory_order_relaxed)) {
             return false;
         }
