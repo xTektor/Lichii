@@ -740,9 +740,16 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
         ssbo_addr = holder + indirect_offset;
     }
+    // A native graphics pointer takes the word after it as its size, as Fritchii ships it: binding
+    // up to 8 MiB of the mapping cost Ocarina of Time about 9% (zortos293/Lichii#101).
+    // EDEN_NX2_GRAPHICS_SSBO_BARE=1 binds the mapping again.
+    static const bool bare_pointers = [] {
+        const char* const value = std::getenv("EDEN_NX2_GRAPHICS_SSBO_BARE");
+        return value != nullptr && value[0] != '0';
+    }();
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             maxwell3d->GetNativeMacroEngine().native_turing ||
+                             (bare_pointers && maxwell3d->GetNativeMacroEngine().native_turing) ||
                                  indirect_offset != ~0U,
                              indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
