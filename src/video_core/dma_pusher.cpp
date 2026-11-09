@@ -16,6 +16,7 @@
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/command_entry_wait.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
@@ -33,6 +34,28 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+namespace {
+
+/// Split position after the last copy-engine method that may write memory.
+u64 g_last_copy_writer{};
+
+/// Copy work can place GPU-written words in any entry. A position past the current one is from
+/// a split session that has since restarted.
+bool CopyWritersPending(const VideoCommon::GpuSplit& split) {
+    if (g_last_copy_writer > split.Position()) {
+        g_last_copy_writer = 0;
+    }
+    return !split.Ran(g_last_copy_writer);
+}
+
+void NoteCopyWriter(const VideoCommon::GpuSplit& split, Engines::EngineTypes type) {
+    if (type == Engines::EngineTypes::MaxwellDMA) {
+        g_last_copy_writer = split.Position();
+    }
+}
+
+} // namespace
 
 bool DmaPusher::IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
                               u32 method) {
@@ -218,8 +241,16 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+        // Pages no GPU work has written yet may still get this entry from compute or copy work
+        // queued before it. The GPU fetches the entry after that work only past a host-level wait
+        // (NoteSync), so the wait stops at that sync. An entry that begins between methods is a
+        // command buffer the CPU writes and does not wait for compute work. A queued copy can
+        // write any entry, so those still wait. Entries that begin inside a method's data are
+        // the parameter lists GPU work writes, and they wait.
+        auto& entry_split = VideoCommon::GpuSplit::Get();
+        if (!gpu_written && entry_split.Active() &&
+            CommandEntryWaitsForWriters(dma_state.method_count, CopyWritersPending(entry_split)) &&
+            entry_split.WaitForSyncedWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -496,6 +527,7 @@ void DmaPusher::CallMethod(u32 argument) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                NoteCopyWriter(split, engine_type);
             } else if (other_writer) {
                 split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
             }
@@ -559,6 +591,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                NoteCopyWriter(split, engine_type);
             } else if (other_writer) {
                 split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
             }
@@ -663,10 +696,12 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
     }
     auto& split = VideoCommon::GpuSplit::Get();
     // Resuming after the copy's tick: the writer wait already ran, and waiting again would also
-    // wait for other channels' work queued during the suspension.
+    // wait for other channels' work queued during the suspension. The dispatch or copy that
+    // rewrites the list is ordered before the fetch only by a host-level wait, so the first read
+    // waits for the work before that wait, not for every writer sent since.
     const bool resumed = list_read_resume.Consume();
     if (split.Active() && !resumed) {
-        split.WaitForWriters();
+        split.WaitForSyncedWriters(VideoCommon::DrainSite::ListCopies);
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;

@@ -42,13 +42,14 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    ListCopies,     ///< Lists on GPU-written pages: writers before the last host sync
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "gp sync fence", "map",           "front start", "front verify", "list copy writers",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -264,6 +265,18 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Ring position of what the front has sent.
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// Whether the back has executed through `position`.
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
 
 private:
     friend struct GpuSplitTestAccess;

@@ -299,6 +299,10 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
+bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
+    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
+}
+
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
