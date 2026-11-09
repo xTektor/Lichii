@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -141,6 +142,23 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+
+    // Every 600 frames with EDEN_NX2_TC_LOG: the memory the staging buffers keep.
+    static const bool log_memory = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+    if (log_memory && ++log_frames % 600 == 0) {
+        const auto total = [](const StagingBuffersCache& cache) {
+            u64 bytes = 0;
+            for (size_t level = 0; level < NUM_LEVELS; ++level) {
+                bytes += (u64{1} << level) * cache[level].entries.size();
+            }
+            return bytes;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Staging buffers: device-local {} MiB, upload {} MiB, download {} MiB, stream {} "
+                 "MiB",
+                 total(device_local_cache) >> 20, total(upload_cache) >> 20,
+                 total(download_cache) >> 20, stream_buffer_size >> 20);
+    }
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);

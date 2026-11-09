@@ -44,7 +44,9 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/range_cover.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/transcode_cache.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -71,6 +73,7 @@ struct ImageViewInOut {
 struct AsyncDecodeContext {
     ImageId image_id;
     Common::ScratchBuffer<u8> decoded_data;
+    TranscodeCache::Data cached; ///< Set instead of decoded_data when the cache had the result
     boost::container::small_vector<BufferImageCopy, 16> copies;
     std::mutex mutex;
     std::atomic_bool complete;
@@ -127,6 +130,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_dead_deletes{};     ///< Evictions of images whose GPU data newer writes covered
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -401,6 +405,10 @@ private:
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
+    /// Whether every byte of a GPU-modified image was written later by other GPU-modified images
+    /// overlapping it, so what it holds is no longer what guest memory should have.
+    [[nodiscard]] bool HasDeadGpuData(const ImageBase& image) const;
+
     void RefreshContents(Image& image, ImageId image_id);
 
     /// Upload data from guest to an image
@@ -646,6 +654,8 @@ private:
     u64 modification_tick = 0;
     u64 frame_tick = 0;
 
+    // Declared before the decode worker, whose jobs fill it, so it outlives them.
+    TranscodeCache transcode_cache;
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
     std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;

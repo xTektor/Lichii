@@ -21,6 +21,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -60,6 +61,13 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     : runtime{runtime_}, device_memory{device_memory_} {
     debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
                   Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+#ifdef __ANDROID__
+    constexpr bool android = true;
+#else
+    constexpr bool android = false;
+#endif
+    transcode_cache.SetBudget(
+        TranscodeCacheBudget(Common::GetMemInfo().TotalPhysicalMemory, android));
 
     // Configure null sampler
     TSCEntry sampler_descriptor{};
@@ -138,6 +146,29 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
+bool TextureCache<P>::HasDeadGpuData(const ImageBase& image) const {
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.guest_size_bytes == 0) {
+        return false;
+    }
+    boost::container::small_vector<std::pair<u64, u64>, 8> newer;
+    const auto consider = [&](ImageId other_id) {
+        const ImageBase& other = slot_images[other_id];
+        if (True(other.flags & ImageFlagBits::GpuModified) &&
+            other.modification_tick > image.modification_tick) {
+            newer.emplace_back(other.gpu_addr, other.gpu_addr + other.guest_size_bytes);
+        }
+    };
+    for (const ImageId other_id : image.overlapping_images) {
+        consider(other_id);
+    }
+    for (const AliasedImage& alias : image.aliased_images) {
+        consider(alias.id);
+    }
+    return !newer.empty() &&
+           RangesCover(image.gpu_addr, image.gpu_addr + image.guest_size_bytes, newer);
+}
+
+template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -167,7 +198,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        // GPU data that newer GPU writes covered whole is not what guest memory should hold: a
+        // title placing per-frame render targets in a shifting arena leaves such images behind
+        // at every shift (Ocarina of Time: ~1,900 downloads and ~140 GPU waits per 600 frames).
+        const bool dead = HasDeadGpuData(image);
+        const bool must_download =
+            !dead && IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        if (dead) {
+            ++gc_dead_deletes;
+        }
         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
@@ -414,12 +453,28 @@ void TextureCache<P>::TickFrame() {
     static u64 frames{};
     if (log_tc && ++frames % 600 == 0) {
         u64 image_bytes{};
+        u64 device_bytes{};
+        u64 render_target_bytes{};
+        u64 scaled_bytes{};
+        size_t scaled_images{};
         size_t images{};
         std::vector<std::pair<u64, const Image*>> largest;
         std::map<u32, std::pair<u64, u32>> by_format;
         for (const auto [image_id, image] : slot_images) {
             const u64 bytes = GetScaledImageSizeBytes(*image);
             image_bytes += bytes;
+            if constexpr (requires { image->DeviceBytes(); }) {
+                const u64 on_device = image->DeviceBytes();
+                device_bytes += on_device;
+                if (image->info.type != ImageType::Buffer &&
+                    True(image->flags & ImageFlagBits::GpuModified)) {
+                    render_target_bytes += on_device;
+                }
+                if (const u64 scaled = image->ScaledDeviceBytes(); scaled != 0) {
+                    scaled_bytes += scaled;
+                    ++scaled_images;
+                }
+            }
             ++images;
             if (debug_stats) {
                 largest.emplace_back(bytes, image);
@@ -428,9 +483,12 @@ void TextureCache<P>::TickFrame() {
                 ++format.second;
             }
         }
-        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+        LOG_INFO(HW_GPU,
+                 "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images "
+                 "{} MiB, allocated {} MiB ({} MiB GPU-written, {} MiB in {} rescaled copies)",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
-                 image_bytes >> 20);
+                 image_bytes >> 20, device_bytes >> 20, render_target_bytes >> 20,
+                 scaled_bytes >> 20, scaled_images);
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
@@ -451,10 +509,17 @@ void TextureCache<P>::TickFrame() {
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded, {} with dead data), {} async decodes, ASTC {} opaque / {} alpha",
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
-                 gc_download_deletes,
+                 gc_download_deletes, gc_dead_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        {
+            const auto [hits, misses] = transcode_cache.TakeCounts();
+            LOG_INFO(HW_GPU,
+                     "Transcode cache last 600 frames: {} hits, {} misses; {} textures {} MiB of {} MiB",
+                     hits, misses, transcode_cache.Size(), transcode_cache.UsedBytes() >> 20,
+                     transcode_cache.Budget() >> 20);
+        }
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
@@ -473,6 +538,7 @@ void TextureCache<P>::TickFrame() {
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
         debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+        gc_dead_deletes = 0;
         images_created = images_deleted = 0;
     }
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -2160,7 +2226,15 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                     unswizzle_data_buffer, &unswizzle_worker);
-        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        const size_t out_size = mapped_span.size_bytes();
+        const u64 key = TranscodeKey(unswizzle_data_buffer, image.info, out_size);
+        if (const auto cached = transcode_cache.Find(key, out_size)) {
+            std::memcpy(mapped_span.data(), cached->data(), cached->size());
+            ConvertedLayout(image.info, copies);
+        } else {
+            ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+            transcode_cache.Insert(key, std::vector<u8>(mapped_span.begin(), mapped_span.end()));
+        }
         image.UploadMemory(staging, copies);
     } else {
         const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
@@ -2394,7 +2468,6 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
 
     image.flags |= ImageFlagBits::IsDecoding;
-    ++async_decodes_queued;
     auto decode = std::make_unique<AsyncDecodeContext>();
     auto* decode_ptr = decode.get();
     decode->image_id = image_id;
@@ -2404,6 +2477,16 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
     const size_t out_size = MapSizeBytes(image);
+    const u64 key = TranscodeKey(local_unswizzle_data_buffer, image.info, out_size);
+    if (auto cached = transcode_cache.Find(key, out_size)) {
+        // Transcoded before: uploaded at the next tick, as a finished decode is.
+        ConvertedLayout(image.info, copies);
+        decode_ptr->copies = std::move(copies);
+        decode_ptr->cached = std::move(cached);
+        decode_ptr->complete = true;
+        return;
+    }
+    ++async_decodes_queued;
     if (False(image.flags & ImageFlagBits::ZeroFilled)) {
         // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
         // a new image showed whatever its memory last held, often other textures. Zero blocks
@@ -2419,10 +2502,12 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
 
     auto func = [out_size, copies, info = image.info,
                  input = std::move(local_unswizzle_data_buffer),
-                 async_decode = decode_ptr]() mutable {
+                 async_decode = decode_ptr, key, cache = &transcode_cache]() mutable {
         async_decode->decoded_data.resize_destructive(out_size);
         std::span copies_span{copies.data(), copies.size()};
         ConvertImage(input, info, async_decode->decoded_data, copies_span);
+        cache->Insert(key, std::vector<u8>(async_decode->decoded_data.begin(),
+                                           async_decode->decoded_data.end()));
 
         // TODO: Do we need this lock?
         std::unique_lock lock{async_decode->mutex};
@@ -2466,15 +2551,17 @@ void TextureCache<P>::TickAsyncDecode() {
             continue;
         }
         Image& image = slot_images[async_decode->image_id];
-        if (async_decode->decoded_data.size() > MapSizeBytes(image)) {
+        const std::span<const u8> decoded =
+            async_decode->cached ? std::span<const u8>{*async_decode->cached}
+                                 : std::span<const u8>{async_decode->decoded_data};
+        if (decoded.size() > MapSizeBytes(image)) {
             LOG_ERROR(HW_GPU, "Async decode of {} bytes for a {}-byte image at {:#x}, dropped",
-                      async_decode->decoded_data.size(), MapSizeBytes(image), image.gpu_addr);
+                      decoded.size(), MapSizeBytes(image), image.gpu_addr);
             i = async_decodes.erase(i);
             continue;
         }
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-        std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
-                    async_decode->decoded_data.size());
+        std::memcpy(staging.mapped_span.data(), decoded.data(), decoded.size());
         image.UploadMemory(staging, async_decode->copies);
         image.flags &= ~ImageFlagBits::IsDecoding;
         has_uploads = true;

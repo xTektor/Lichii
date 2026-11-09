@@ -124,6 +124,7 @@ private:
     StagingBuffersCache download_cache;
 
     size_t current_delete_level = 0;
+    u64 log_frames = 0;
     u64 buffer_index = 0;
     u64 unique_ids{};
 };

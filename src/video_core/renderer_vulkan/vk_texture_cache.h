@@ -521,6 +521,18 @@ public:
         return original_image.GetMemoryBlock();
     }
 
+    /// Device memory the image's allocations hold: the image, its rescaled copy and its compute
+    /// unswizzle buffer (EDEN_NX2_TC_LOG).
+    [[nodiscard]] u64 DeviceBytes() const noexcept {
+        return original_image.GetMemoryBlock().size + ScaledDeviceBytes() +
+               (has_compute_unswizzle_buffer ? compute_unswizzle_buffer_size : 0);
+    }
+
+    /// Device memory of the rescaled copy alone.
+    [[nodiscard]] u64 ScaledDeviceBytes() const noexcept {
+        return scaled_image.GetMemoryBlock().size;
+    }
+
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
         return std::exchange(initialized, true);

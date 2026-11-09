@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
@@ -1305,6 +1306,23 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
         copy.buffer_image_height = mip_size.height;
         output_offset += size;
     }
+}
+
+u64 TranscodeKey(std::span<const u8> input, const ImageInfo& info, size_t out_size) {
+    const std::array<u64, 6> layout{
+        static_cast<u64>(info.format) | (static_cast<u64>(info.type) << 16) |
+            (static_cast<u64>(Settings::GetAstcRecompression()) << 24) |
+            (u64{info.astc_opaque} << 32),
+        u64{info.size.width} | (u64{info.size.height} << 32),
+        u64{info.size.depth},
+        static_cast<u64>(info.resources.levels) | (static_cast<u64>(info.resources.layers) << 32),
+        static_cast<u64>(out_size),
+        static_cast<u64>(input.size()),
+    };
+    const u64 data_hash =
+        Common::CityHash64(reinterpret_cast<const char*>(input.data()), input.size());
+    return Common::CityHash64WithSeed(reinterpret_cast<const char*>(layout.data()),
+                                      sizeof(layout), data_hash);
 }
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,

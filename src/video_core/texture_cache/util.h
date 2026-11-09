@@ -130,6 +130,10 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 /// Rewrites `copies` (from UnswizzleImage) to the layout ConvertImage produces, without converting.
 void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
 
+/// Identifies what ConvertImage makes of input for info: the transcode cache's key. It covers the
+/// guest data, the layout and the recompression the output depends on.
+[[nodiscard]] u64 TranscodeKey(std::span<const u8> input, const ImageInfo& info, size_t out_size);
+
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies);
 
